@@ -1,6 +1,6 @@
 import spacy
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Load spaCy model
 try:
@@ -60,8 +60,28 @@ class NLPProcessor:
             }
         }
         
-        # Budget pattern - improved to catch approximate values
-        self.budget_pattern = r"(?:budget|price|cost|around|about|approximately)\s+(?:is|of)?\s*\$?(\d+(?:,\d+)?(?:\.\d+)?)|(\d+(?:,\d+)?(?:\.\d+)?)\s*(?:dollars|usd)"
+        # Improved budget patterns
+        self.budget_patterns = [
+            # Exact budget pattern (e.g., "$1500", "1500 dollars", "budget of $1500")
+            r"(?:budget|price|cost|spend|spending)\s+(?:is|of)?\s*\$?(\d+(?:,\d+)?(?:\.\d+)?)|(?:looking to spend|would spend|planning to spend)\s+\$?(\d+(?:,\d+)?(?:\.\d+)?)",
+            
+            # Approximate budget pattern (e.g., "about $1500", "around $1500")
+            r"(?:about|around|approximately|roughly|close to)\s+\$?(\d+(?:,\d+)?(?:\.\d+)?)",
+            
+            # Upper limit pattern (e.g., "under $1500", "less than $1500")
+            r"(?:under|below|less than|at most|maximum of|no more than|up to|not more than)\s+\$?(\d+(?:,\d+)?(?:\.\d+)?)",
+            
+            # Lower limit pattern (e.g., "over $1500", "more than $1500")
+            r"(?:over|above|more than|at least|minimum of|starting from|starting at)\s+\$?(\d+(?:,\d+)?(?:\.\d+)?)",
+            
+            # Range pattern (e.g., "between $1000 and $1500")
+            r"between\s+\$?(\d+(?:,\d+)?(?:\.\d+)?)\s+(?:and|to|[-])\s+\$?(\d+(?:,\d+)?(?:\.\d+)?)",
+            
+            # Fallback for standalone dollar amounts with optional budget context
+            r"(?:budget|build)(?:[^$]*?)\$(\d+(?:,\d+)?(?:\.\d+)?)",
+            r"\$(\d+(?:,\d+)?(?:\.\d+)?)",
+            r"(\d+(?:,\d+)?(?:\.\d+)?)\s*(?:dollars|usd)"
+        ]
         
         # Gaming phrases pattern
         self.gaming_phrases = [
@@ -102,27 +122,71 @@ class NLPProcessor:
         
         return component_mentions
     
-    def extract_budget(self, text: str) -> Optional[float]:
-        """Extract budget from text with improved pattern matching"""
+    def extract_budget(self, text: str) -> Dict[str, float]:
+        """Extract budget information from text with improved pattern matching
+        
+        Returns:
+            A dictionary with keys:
+            - value: The numeric budget value
+            - type: 'exact', 'approximate', 'maximum', 'minimum', or 'range'
+            - range_min: Lower value in a range (if applicable)
+            - range_max: Upper value in a range (if applicable)
+            - tolerance: Percentage tolerance for approximate values
+        """
         text = text.lower()
+        result = {
+            "value": 1500.0,  # Default value
+            "type": "exact",  # Default type
+            "tolerance": 0.0   # Default tolerance (percentage)
+        }
         
-        # First try the main budget pattern
-        matches = re.findall(self.budget_pattern, text)
-        if matches:
-            # Process matches from the regex groups
-            for match in matches:
-                # Match could be in either group
-                budget_str = next((m for m in match if m), None)
-                if budget_str:
-                    # Remove commas and convert to float
-                    return float(budget_str.replace(',', ''))
+        # Check for budget patterns in order of specificity
+        for i, pattern in enumerate(self.budget_patterns):
+            matches = re.search(pattern, text)
+            if matches:
+                # Handle different patterns
+                if i == 0:  # Exact budget
+                    # Get the first non-None group
+                    for group in matches.groups():
+                        if group:
+                            result["value"] = float(group.replace(',', ''))
+                            result["type"] = "exact"
+                            result["tolerance"] = 0.0
+                            break
+                elif i == 1:  # Approximate budget
+                    result["value"] = float(matches.group(1).replace(',', ''))
+                    result["type"] = "approximate"
+                    result["tolerance"] = 0.07  # 7% tolerance for "about" and "around" (was 10%)
+                elif i == 2:  # Upper limit
+                    result["value"] = float(matches.group(1).replace(',', ''))
+                    result["type"] = "maximum"
+                    # Setting maximum a bit below the stated limit to ensure we stay under budget
+                    result["value"] = result["value"] * 0.97  # Target 3% below maximum
+                    result["tolerance"] = 0.0
+                elif i == 3:  # Lower limit
+                    result["value"] = float(matches.group(1).replace(',', ''))
+                    result["type"] = "minimum"
+                    # Setting minimum a bit above the stated minimum to ensure we're over the budget
+                    result["value"] = result["value"] * 1.05  # Target 5% above minimum
+                    result["tolerance"] = 0.0
+                elif i == 4:  # Range
+                    min_val = float(matches.group(1).replace(',', ''))
+                    max_val = float(matches.group(2).replace(',', ''))
+                    # Use the middle of the range as the target value
+                    result["value"] = (min_val + max_val) / 2
+                    result["type"] = "range"
+                    result["range_min"] = min_val
+                    result["range_max"] = max_val
+                    result["tolerance"] = (max_val - min_val) / 2 / result["value"]  # Tolerance as percentage
+                else:  # Fallback patterns (standalone dollar amounts)
+                    result["value"] = float(matches.group(1).replace(',', ''))
+                    result["type"] = "exact"
+                    result["tolerance"] = 0.05  # Allow 5% flexibility for standalone dollar amounts
+                
+                return result
         
-        # Fallback: try to find any number after words like "budget", "around", etc.
-        budget_mentions = re.findall(r"(?:budget|price|cost|around|about|approximately).*?(\d+)", text)
-        if budget_mentions:
-            return float(budget_mentions[0].replace(',', ''))
-        
-        return None
+        # No match found, return default
+        return result
     
     def extract_use_case(self, text: str) -> Dict[str, float]:
         """Extract use case preferences from text with improved gaming detection"""
@@ -177,10 +241,22 @@ class NLPProcessor:
         result = {
             "component_mentions": self.extract_component_mentions(text),
             "budget": self.extract_budget(text),
-            "use_case": self.extract_use_case(text)
+            "use_case": self.extract_use_case(text),
+            "mentioned_games": self._extract_game_mentions(text)
         }
         
         return result
+    
+    def _extract_game_mentions(self, text: str) -> List[str]:
+        """Extract mentioned games from text"""
+        text = text.lower()
+        mentioned_games = []
+        
+        for game in self.popular_games:
+            if game in text:
+                mentioned_games.append(game)
+        
+        return mentioned_games
     
     def _correct_game_typos(self, text: str) -> str:
         """Correct common typos in game names"""

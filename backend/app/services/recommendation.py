@@ -128,7 +128,60 @@ class RecommendationEngine:
         # Initialize result with placeholders
         selected_components = {}
         
-        # Select CPU based on tier keywords
+        # Adjust budget allocations based on total budget to prevent exceeding
+        # These percentages should add up to <= 90% to leave room for other components
+        if budget:
+            if budget <= 1000:
+                # Budget builds need more conservative component allocation
+                cpu_percent = 0.20  # 20% for CPU
+                gpu_percent = 0.35  # 35% for GPU
+                mb_percent = 0.12   # 12% for motherboard 
+                ram_percent = 0.08  # 8% for RAM
+                psu_percent = 0.08  # 8% for PSU
+            elif budget <= 1500:
+                # Mid-range builds
+                cpu_percent = 0.22  # 22% for CPU
+                gpu_percent = 0.37  # 37% for GPU
+                mb_percent = 0.13   # 13% for motherboard
+                ram_percent = 0.08  # 8% for RAM
+                psu_percent = 0.07  # 7% for PSU
+            else:
+                # High-end builds can allocate more to CPU and GPU
+                cpu_percent = 0.23  # 23% for CPU
+                gpu_percent = 0.40  # 40% for GPU
+                mb_percent = 0.12   # 12% for motherboard
+                ram_percent = 0.09  # 9% for RAM
+                psu_percent = 0.06  # 6% for PSU
+        else:
+            # Default allocations if no budget specified
+            cpu_percent = 0.25
+            gpu_percent = 0.40
+            mb_percent = 0.15
+            ram_percent = 0.10
+            psu_percent = 0.10
+            
+        # For gaming builds, allocate more to GPU and less to CPU
+        if use_case == "gaming":
+            # Adjust for gaming - more GPU, less CPU
+            if budget and budget <= 1200:
+                # For $1200 gaming builds specifically
+                cpu_percent = 0.18  # 18% for CPU (~$216)
+                gpu_percent = 0.40  # 40% for GPU (~$480)
+                mb_percent = 0.12   # 12% for motherboard (~$144)
+                ram_percent = 0.07  # 7% for RAM (~$84)
+                psu_percent = 0.06  # 6% for PSU (~$72)
+            else:
+                # Slight adjustment for other gaming budgets
+                cpu_percent -= 0.03
+                gpu_percent += 0.03
+        
+        # For productivity, allocate more to CPU and RAM
+        if use_case == "productivity":
+            cpu_percent += 0.05
+            gpu_percent -= 0.10
+            ram_percent += 0.05
+        
+        # Select CPU based on tier keywords and budget
         cpu_keywords = tier_specs.get("cpu_keywords", [])
         cpus = db.query(CPU).all()
         
@@ -138,18 +191,31 @@ class RecommendationEngine:
             if any(keyword.lower() in cpu.name.lower() for keyword in cpu_keywords):
                 matching_cpus.append(cpu)
         
-        # If no match, use all CPUs
-        if not matching_cpus:
+        # If no match or very few matches (less than 3), use all CPUs
+        if len(matching_cpus) < 3:
             matching_cpus = cpus
             
-        # Sort by price, with mid-tier CPUs first
-        cpu_budget = (budget * 0.25) if budget else None
+        # Calculate CPU budget
+        cpu_budget = (budget * cpu_percent) if budget else None
         selected_cpu = self._select_component_by_price(matching_cpus, cpu_budget)
         
         if selected_cpu:
             selected_components["cpu"] = selected_cpu
+            
+            # Recalculate remaining budget after CPU selection
+            if budget:
+                remaining_budget = budget - selected_cpu.price
+                # Recalculate percentages for other components based on remaining budget
+                if remaining_budget > 0:
+                    total_remaining_percent = gpu_percent + mb_percent + ram_percent + psu_percent
+                    if total_remaining_percent > 0:
+                        adjustment_factor = 1.0 / total_remaining_percent
+                        gpu_percent = gpu_percent * adjustment_factor
+                        mb_percent = mb_percent * adjustment_factor
+                        ram_percent = ram_percent * adjustment_factor
+                        psu_percent = psu_percent * adjustment_factor
         
-        # Select GPU based on tier keywords
+        # Select GPU based on tier keywords and adjusted budget
         gpu_keywords = tier_specs.get("gpu_keywords", [])
         gpus = db.query(GPU).all()
         
@@ -159,18 +225,41 @@ class RecommendationEngine:
             if any(keyword.lower() in gpu.name.lower() for keyword in gpu_keywords):
                 matching_gpus.append(gpu)
         
-        # If no match, use all GPUs
-        if not matching_gpus:
+        # If no match or very few matches, use all GPUs
+        if len(matching_gpus) < 3:
             matching_gpus = gpus
             
-        # Sort by price, with mid-tier GPUs first
-        gpu_budget = (budget * 0.4) if budget else None
+        # Calculate GPU budget based on remaining budget if CPU was selected
+        if budget and "cpu" in selected_components:
+            remaining_budget = budget - selected_components["cpu"].price
+            gpu_budget = remaining_budget * gpu_percent
+        else:
+            gpu_budget = (budget * gpu_percent) if budget else None
+            
         selected_gpu = self._select_component_by_price(matching_gpus, gpu_budget)
         
         if selected_gpu:
             selected_components["gpu"] = selected_gpu
+            
+            # Recalculate remaining budget after GPU selection
+            if budget:
+                # Calculate what's been spent so far
+                spent_budget = 0
+                for component in selected_components.values():
+                    if not isinstance(component, list):  # Skip RAM for now
+                        spent_budget += component.price
+                
+                remaining_budget = budget - spent_budget
+                # Recalculate percentages for remaining components
+                if remaining_budget > 0:
+                    total_remaining_percent = mb_percent + ram_percent + psu_percent
+                    if total_remaining_percent > 0:
+                        adjustment_factor = 1.0 / total_remaining_percent
+                        mb_percent = mb_percent * adjustment_factor
+                        ram_percent = ram_percent * adjustment_factor
+                        psu_percent = psu_percent * adjustment_factor
         
-        # Select Motherboard compatible with CPU
+        # Select Motherboard compatible with CPU with adjusted budget
         if "cpu" in selected_components:
             cpu = selected_components["cpu"]
             motherboards = db.query(Motherboard).all()
@@ -182,13 +271,39 @@ class RecommendationEngine:
             ]
             
             if compatible_motherboards:
-                # Select a mid-price motherboard
-                mb_budget = (budget * 0.15) if budget else None
+                # Calculate motherboard budget based on remaining budget
+                if budget:
+                    spent_budget = 0
+                    for component in selected_components.values():
+                        if not isinstance(component, list):
+                            spent_budget += component.price
+                    
+                    remaining_budget = budget - spent_budget
+                    mb_budget = remaining_budget * mb_percent
+                else:
+                    mb_budget = (budget * mb_percent) if budget else None
+                    
                 selected_motherboard = self._select_component_by_price(compatible_motherboards, mb_budget)
                 if selected_motherboard:
                     selected_components["motherboard"] = selected_motherboard
+                    
+                    # Recalculate remaining budget after motherboard selection
+                    if budget:
+                        spent_budget = 0
+                        for component in selected_components.values():
+                            if not isinstance(component, list):
+                                spent_budget += component.price
+                        
+                        remaining_budget = budget - spent_budget
+                        # Recalculate percentages for RAM and PSU
+                        if remaining_budget > 0:
+                            total_remaining_percent = ram_percent + psu_percent
+                            if total_remaining_percent > 0:
+                                adjustment_factor = 1.0 / total_remaining_percent
+                                ram_percent = ram_percent * adjustment_factor
+                                psu_percent = psu_percent * adjustment_factor
         
-        # Select RAM based on capacity requirements
+        # Select RAM based on capacity requirements and adjusted budget
         ram_capacity = tier_specs.get("ram_capacity", 16)
         rams = db.query(RAM).all()
         
@@ -207,17 +322,29 @@ class RecommendationEngine:
             # For simplicity, just take the first RAM that has the right capacity per stick
             for ram in rams:
                 if ram.capacity in [8, 16, 32] and ram.modules >= 1:
-                    # Calculate how many we need
-                    needed_sticks = ram_capacity // ram.capacity
-                    if needed_sticks <= 4:  # Most motherboards support 4 sticks max
+                    # Calculate how many sticks we need
+                    needed_sticks = min(ram_capacity // ram.capacity, 4)  # Most motherboards support 4 sticks max
+                    if needed_sticks > 0:
                         matching_rams.append([ram] * needed_sticks)
                         break
             
             # If still no match, just take any RAM
-            if not matching_rams:
+            if not matching_rams and rams:
                 matching_rams.append([rams[0]])
         
-        # Select the RAM set with the best price/capacity ratio
+        # Calculate what's been spent so far
+        if budget:
+            spent_budget = 0
+            for component in selected_components.values():
+                if not isinstance(component, list):
+                    spent_budget += component.price
+            
+            remaining_budget = budget - spent_budget
+            ram_budget = remaining_budget * ram_percent
+        else:
+            ram_budget = (budget * ram_percent) if budget else None
+        
+        # Select the RAM set with the best price/capacity ratio within budget
         if matching_rams:
             ram_sets_with_price = []
             for ram_set in matching_rams:
@@ -225,19 +352,40 @@ class RecommendationEngine:
                 total_capacity = sum(ram.capacity for ram in ram_set)
                 ram_sets_with_price.append((ram_set, total_price, total_capacity))
             
-            # Sort by price/capacity ratio
-            ram_sets_with_price.sort(key=lambda x: x[1]/x[2])
+            # Sort by price
+            ram_sets_with_price.sort(key=lambda x: x[1])
             
-            # Take the best value RAM set
-            ram_budget = (budget * 0.1) if budget else None
+            # Take the best RAM set within budget
+            selected_ram = None
             for ram_set, price, _ in ram_sets_with_price:
                 if not ram_budget or price <= ram_budget:
-                    selected_components["ram"] = ram_set
+                    selected_ram = ram_set
+                    if selected_ram is not ram_sets_with_price[-1][0]:  # If not the best RAM
+                        # Try the next one if it fits in budget
+                        next_index = ram_sets_with_price.index((ram_set, price, _)) + 1
+                        if next_index < len(ram_sets_with_price) and ram_sets_with_price[next_index][1] <= ram_budget:
+                            selected_ram = ram_sets_with_price[next_index][0]
                     break
             
+            # If we found a RAM set, add it
+            if selected_ram:
+                selected_components["ram"] = selected_ram
             # If none match budget, take the cheapest
-            if "ram" not in selected_components and ram_sets_with_price:
+            elif ram_sets_with_price:
                 selected_components["ram"] = ram_sets_with_price[0][0]
+        
+        # Calculate what's been spent so far
+        if budget:
+            spent_budget = 0
+            for component in selected_components.values():
+                if isinstance(component, list):  # Handle RAM which is a list
+                    spent_budget += sum(ram.price for ram in component)
+                else:
+                    spent_budget += component.price
+            
+            remaining_budget = budget - spent_budget
+        else:
+            remaining_budget = None
         
         # Select Power Supply
         # Calculate power requirements
@@ -246,20 +394,32 @@ class RecommendationEngine:
         gpu_power = selected_components.get("gpu").tdp if "gpu" in selected_components else 150
         
         # Add 50% headroom
-        total_power = (base_power + cpu_power + gpu_power) * 1.5
+        total_power = int((base_power + cpu_power + gpu_power) * 1.5)
         
         # Find appropriate PSU
         psus = db.query(PowerSupply).all()
         suitable_psus = [psu for psu in psus if psu.wattage >= total_power]
         
+        # Calculate PSU budget from remaining budget
+        if budget and remaining_budget is not None:
+            psu_budget = remaining_budget * 0.9  # Use up to 90% of remaining budget for PSU
+        else:
+            psu_budget = (budget * psu_percent) if budget else None
+        
         if suitable_psus:
-            psu_budget = (budget * 0.1) if budget else None
             selected_psu = self._select_component_by_price(suitable_psus, psu_budget)
             if selected_psu:
                 selected_components["power_supply"] = selected_psu
         elif psus:
-            # If no PSU meets the requirement, take the highest wattage
-            selected_components["power_supply"] = max(psus, key=lambda x: x.wattage)
+            # If no PSU meets the requirement, take the highest wattage within budget
+            within_budget_psus = [psu for psu in psus if not psu_budget or psu.price <= psu_budget]
+            if within_budget_psus:
+                selected_components["power_supply"] = max(within_budget_psus, key=lambda x: x.wattage)
+            else:
+                # If none within budget, take the cheapest suitable one
+                suitable_psus = sorted(psus, key=lambda x: x.price)
+                if suitable_psus:
+                    selected_components["power_supply"] = suitable_psus[0]
         
         return selected_components
     
@@ -290,89 +450,337 @@ class RecommendationEngine:
         """Generate PC build recommendations based on NLP analysis"""
         # Extract data from NLP result
         use_case_scores = nlp_data.get("use_case", {})
-        budget = nlp_data.get("budget")
+        budget_info = nlp_data.get("budget", {})
         
-        # Determine primary use case and tier
+        # Parse budget information
+        if isinstance(budget_info, dict):
+            target_budget = budget_info.get("value", 1500.0)
+            budget_type = budget_info.get("type", "exact")
+            
+            # Handle different budget types
+            if budget_type == "maximum":
+                # For "under $X" queries, ensure we stay under budget
+                target_budget = target_budget * 0.95  # Target 5% below to ensure we stay under
+                price_tolerance = target_budget * 0.05  # Small tolerance
+            elif budget_type == "minimum":
+                # For "over $X" queries, ensure we meet minimum
+                price_tolerance = target_budget * 0.15  # Larger tolerance for minimum budgets
+            elif budget_type == "approximate":
+                # For "about $X" queries
+                price_tolerance = target_budget * budget_info.get("tolerance", 0.1)
+            elif budget_type == "range":
+                # For range budgets, use the middle value with tolerance equal to half the range
+                target_budget = (budget_info.get("range_min", target_budget * 0.8) + 
+                                budget_info.get("range_max", target_budget * 1.2)) / 2
+                price_tolerance = (budget_info.get("range_max", target_budget * 1.2) - 
+                                  budget_info.get("range_min", target_budget * 0.8)) / 2
+            else:
+                # Default exact budget with 5% tolerance
+                price_tolerance = target_budget * 0.05
+        else:
+            # Legacy support for when budget was just a number
+            target_budget = budget_info if budget_info else 1500.0
+            price_tolerance = target_budget * 0.1  # 10% tolerance
+        
+        # Determine use case and performance tier
         use_case = self.determine_use_case(use_case_scores)
-        tier = self.determine_tier(budget, use_case)
+        tier = self.determine_tier(target_budget, use_case)
         
-        # Generate three recommendations: budget, recommended (target), and high-end
-        recommendations = {}
+        # Check if budget is within the max/min budget for this tier
+        tier_budget_min = self.performance_tiers[use_case][tier].get("min_price", 0)
+        tier_budget_max = self.performance_tiers[use_case][tier].get("max_price", 999999)
         
-        # 1. Budget version (one tier down or the same if already budget)
-        budget_tier = "budget"
-        budget_components = self.select_components(
-            db, 
-            use_case, 
-            budget_tier,
-            budget * 0.8 if budget else None
-        )
-        budget_price = sum(
-            c.price for c in budget_components.values() 
-            if not isinstance(c, list)
-        ) + sum(
-            sum(r.price for r in rams) for rams in 
-            [budget_components.get('ram', [])] if rams
-        )
+        if target_budget < tier_budget_min:
+            # If budget is too low for tier, adjust tier down
+            if tier == "mid_range" or tier == "high_end":
+                tier = "budget" if target_budget < tier_budget_min else tier
+        elif target_budget > tier_budget_max:
+            # If budget is too high for tier, adjust tier up
+            if tier == "budget":
+                tier = "mid_range"
+            elif tier == "mid_range":
+                tier = "high_end"
         
-        # 2. Recommended version (target tier)
-        recommended_components = self.select_components(
-            db, 
-            use_case, 
-            tier,
-            budget
-        )
-        recommended_price = sum(
-            c.price for c in recommended_components.values() 
-            if not isinstance(c, list)
-        ) + sum(
-            sum(r.price for r in rams) for rams in 
-            [recommended_components.get('ram', [])] if rams
-        )
+        def is_within_budget(price):
+            """Check if price is within acceptable range of target budget"""
+            # For maximum budget type, ensure we're always under
+            if budget_type == "maximum":
+                return price <= target_budget
+            # For minimum budget type, ensure we're always over minimum
+            elif budget_type == "minimum":
+                return price >= target_budget
+            # For other budget types, allow tolerance
+            else:
+                return abs(price - target_budget) <= price_tolerance
         
-        # 3. High-end version (one tier up or the same if already high-end)
-        high_end_tier = "high_end"
-        high_end_components = self.select_components(
-            db, 
-            use_case, 
-            high_end_tier,
-            budget * 1.2 if budget else None
-        )
-        high_end_price = sum(
-            c.price for c in high_end_components.values() 
-            if not isinstance(c, list)
-        ) + sum(
-            sum(r.price for r in rams) for rams in 
-            [high_end_components.get('ram', [])] if rams
-        )
+        # Generate recommendations with budget adherence
+        recommended_components = self.select_components(db, use_case, tier, target_budget)
+        
+        # Calculate total price of components
+        total_price = 0
+        for component in recommended_components.values():
+            if isinstance(component, list):  # Handle RAM which is a list
+                total_price += sum(ram.price for ram in component)
+            else:
+                total_price += component.price
+        
+        # Apply budget adjustments if needed
+        if not is_within_budget(total_price):
+            if total_price > target_budget + price_tolerance:
+                # Over budget - downgrade components
+                recommended_components = self._downgrade_components(db, recommended_components, total_price - target_budget, use_case)
+            elif budget_type != "maximum" and total_price < target_budget - price_tolerance:
+                # Under budget - upgrade components if not maximum budget type
+                # Don't upgrade if it's a "maximum" budget since we want to stay under
+                recommended_components = self._upgrade_components(db, recommended_components, target_budget - total_price, use_case)
+        
+        # Recalculate total after adjustments
+        total_price = 0
+        for component in recommended_components.values():
+            if isinstance(component, list):  # Handle RAM which is a list
+                total_price += sum(ram.price for ram in component)
+            else:
+                total_price += component.price
         
         # Format results
         recommendations = {
             "user_requirements": {
                 "use_case": use_case,
                 "target_tier": tier,
-                "budget": budget
+                "budget": target_budget,
+                "budget_type": budget_type if isinstance(budget_info, dict) else "exact"
             },
             "builds": {
-                "budget": {
-                    "components": self._format_component_list(budget_components),
-                    "total_price": round(budget_price, 2),
-                    "compatibility": self.compatibility_checker.check_system_compatibility(budget_components)["compatible"]
-                },
                 "recommended": {
                     "components": self._format_component_list(recommended_components),
-                    "total_price": round(recommended_price, 2),
+                    "total_price": round(total_price, 2),
                     "compatibility": self.compatibility_checker.check_system_compatibility(recommended_components)["compatible"]
-                },
-                "high_end": {
-                    "components": self._format_component_list(high_end_components),
-                    "total_price": round(high_end_price, 2),
-                    "compatibility": self.compatibility_checker.check_system_compatibility(high_end_components)["compatible"]
                 }
             }
         }
         
         return recommendations
+
+    def _downgrade_components(self, db, components, amount_to_reduce, use_case):
+        """Downgrade components to reduce total price by specified amount"""
+        if not components:
+            return components
+        
+        # Make a copy to avoid modifying the original
+        components = components.copy()
+        
+        # Priority order for downgrades (most expensive/flexible first)
+        downgrade_priority = ["gpu", "cpu", "motherboard", "ram", "power_supply"]
+        
+        # Keep track of current price
+        current_price = 0
+        for component in components.values():
+            if isinstance(component, list):  # Handle RAM which is a list
+                current_price += sum(ram.price for ram in component)
+            else:
+                current_price += component.price
+        
+        target_price = current_price - amount_to_reduce
+        
+        # Try to downgrade components in priority order
+        for component_type in downgrade_priority:
+            if component_type not in components:
+                continue
+                
+            current_component = components[component_type]
+            
+            # Handle RAM separately since it's a list
+            if component_type == "ram" and isinstance(current_component, list):
+                # Get all RAM options and find cheaper alternatives
+                all_rams = db.query(RAM).all()
+                
+                # Calculate current RAM price
+                current_ram_price = sum(ram.price for ram in current_component)
+                current_capacity = sum(ram.capacity for ram in current_component)
+                
+                # Find cheaper RAM combinations with similar capacity
+                cheaper_ram_options = []
+                for ram in all_rams:
+                    # Calculate how many sticks we would need
+                    needed_sticks = max(1, current_capacity // ram.capacity)
+                    if needed_sticks <= 4:  # Most motherboards support up to 4 sticks
+                        total_price = ram.price * needed_sticks
+                        if total_price < current_ram_price:
+                            cheaper_ram_options.append(([ram] * needed_sticks, total_price))
+                
+                # Sort by price (highest first so we reduce least)
+                cheaper_ram_options.sort(key=lambda x: x[1], reverse=True)
+                
+                # Replace with cheaper option if found
+                if cheaper_ram_options:
+                    for ram_option, price in cheaper_ram_options:
+                        # Calculate new total price if we use this RAM
+                        price_diff = current_ram_price - price
+                        new_total = current_price - price_diff
+                        
+                        # Use this RAM if it gets us closer to target without going under
+                        if new_total >= target_price:
+                            components[component_type] = ram_option
+                            current_price = new_total
+                            break
+                            
+                # If we've reached target price, stop downgrading
+                if current_price <= target_price + (target_price * 0.05):  # Allow 5% tolerance
+                    break
+                    
+            else:
+                # For other component types
+                component_model = current_component.__class__
+                all_components = db.query(component_model).all()
+                
+                # Get current component price
+                current_component_price = current_component.price
+                
+                # Find cheaper alternatives
+                cheaper_alternatives = [c for c in all_components if c.price < current_component_price]
+                
+                # For CPU and motherboard, ensure socket compatibility
+                if component_type == "motherboard" and "cpu" in components:
+                    cheaper_alternatives = [mb for mb in cheaper_alternatives 
+                                          if mb.socket == components["cpu"].socket]
+                
+                # Sort by price (highest first so we reduce least)
+                cheaper_alternatives.sort(key=lambda x: x.price, reverse=True)
+                
+                # Replace with cheaper alternative if found
+                if cheaper_alternatives:
+                    for alternative in cheaper_alternatives:
+                        # Calculate new total price with this alternative
+                        price_diff = current_component_price - alternative.price
+                        new_total = current_price - price_diff
+                        
+                        # Use this alternative if it gets us closer to target without going under
+                        if new_total >= target_price:
+                            components[component_type] = alternative
+                            current_price = new_total
+                            break
+                
+                # If we've reached target price, stop downgrading
+                if current_price <= target_price + (target_price * 0.05):  # Allow 5% tolerance
+                    break
+        
+        return components
+        
+    def _upgrade_components(self, db, components, amount_to_add, use_case):
+        """Upgrade components to increase total price by specified amount"""
+        if not components:
+            return components
+        
+        # Make a copy to avoid modifying the original
+        components = components.copy()
+        
+        # Priority order for upgrades based on use case
+        if use_case == "gaming":
+            # For gaming, prioritize GPU then CPU
+            upgrade_priority = ["gpu", "cpu", "ram", "motherboard", "power_supply"]
+        elif use_case == "productivity":
+            # For productivity, prioritize CPU then RAM
+            upgrade_priority = ["cpu", "ram", "gpu", "motherboard", "power_supply"]
+        else:  # content_creation
+            # For content creation, balance CPU and GPU
+            upgrade_priority = ["gpu", "cpu", "ram", "motherboard", "power_supply"]
+        
+        # Keep track of current price
+        current_price = 0
+        for component in components.values():
+            if isinstance(component, list):  # Handle RAM which is a list
+                current_price += sum(ram.price for ram in component)
+            else:
+                current_price += component.price
+        
+        target_price = current_price + amount_to_add
+        
+        # Try to upgrade components in priority order
+        for component_type in upgrade_priority:
+            if component_type not in components:
+                continue
+                
+            current_component = components[component_type]
+            
+            # Handle RAM separately since it's a list
+            if component_type == "ram" and isinstance(current_component, list):
+                # Get all RAM options and find better alternatives
+                all_rams = db.query(RAM).all()
+                
+                # Calculate current RAM price and capacity
+                current_ram_price = sum(ram.price for ram in current_component)
+                current_capacity = sum(ram.capacity for ram in current_component)
+                
+                # Find better RAM combinations (higher capacity or faster)
+                better_ram_options = []
+                for ram in all_rams:
+                    # Look for higher capacity or same capacity with higher speed
+                    if ram.capacity > current_component[0].capacity or (
+                        ram.capacity == current_component[0].capacity and ram.speed > current_component[0].speed
+                    ):
+                        # Calculate how many sticks we would need
+                        needed_sticks = max(1, min(4, 32 // ram.capacity))  # Aim for 32GB or current
+                        total_price = ram.price * needed_sticks
+                        if total_price > current_ram_price:
+                            better_ram_options.append(([ram] * needed_sticks, total_price))
+                
+                # Sort by price (lowest first)
+                better_ram_options.sort(key=lambda x: x[1])
+                
+                # Replace with better option if found
+                if better_ram_options:
+                    for ram_option, price in better_ram_options:
+                        # Calculate new total price if we use this RAM
+                        price_diff = price - current_ram_price
+                        new_total = current_price + price_diff
+                        
+                        # Use this RAM if it keeps us within budget
+                        if new_total <= target_price:
+                            components[component_type] = ram_option
+                            current_price = new_total
+                            break
+                            
+                # If we've reached target price, stop upgrading
+                if current_price >= target_price - (target_price * 0.05):  # Allow 5% tolerance
+                    break
+                    
+            else:
+                # For other component types
+                component_model = current_component.__class__
+                all_components = db.query(component_model).all()
+                
+                # Get current component price
+                current_component_price = current_component.price
+                
+                # Find better alternatives
+                better_alternatives = [c for c in all_components if c.price > current_component_price]
+                
+                # For motherboard, ensure socket compatibility
+                if component_type == "motherboard" and "cpu" in components:
+                    better_alternatives = [mb for mb in better_alternatives 
+                                         if mb.socket == components["cpu"].socket]
+                
+                # Sort by price (lowest first)
+                better_alternatives.sort(key=lambda x: x.price)
+                
+                # Replace with better alternative if found
+                if better_alternatives:
+                    for alternative in better_alternatives:
+                        # Calculate new total price with this alternative
+                        price_diff = alternative.price - current_component_price
+                        new_total = current_price + price_diff
+                        
+                        # Use this alternative if it keeps us within budget
+                        if new_total <= target_price:
+                            components[component_type] = alternative
+                            current_price = new_total
+                            break
+                
+                # If we've reached target price, stop upgrading
+                if current_price >= target_price - (target_price * 0.05):  # Allow 5% tolerance
+                    break
+        
+        return components
     
     def _format_component_list(self, components: Dict) -> Dict[str, Dict]:
         """Format component dictionary for API response"""

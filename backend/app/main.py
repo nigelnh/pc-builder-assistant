@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import components, nlp, compatibility
+from app.routers import components, nlp, compatibility, recommendation, builds, performance
 
 app = FastAPI(
     title="PC Builder API",
@@ -22,6 +22,14 @@ app.add_middleware(
 app.include_router(components.router)
 app.include_router(nlp.router)
 app.include_router(compatibility.router)
+app.include_router(recommendation.router)
+app.include_router(builds.router)
+app.include_router(performance.router)
+
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the PC Builder API!"}
+    return {
+        "message": "Welcome to the PC Builder API",
+        "status": "running",
+        "note": "If you're having issues with the frontend, ensure this backend server is running on http://localhost:8000 and CORS is enabled."
+    }
